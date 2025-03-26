@@ -1,296 +1,182 @@
 # -*- coding: utf-8 -*-
 import os
 import asyncio
-import pandas as pd
-from flask import Flask, render_template, request, send_from_directory, Response, jsonify, redirect, url_for, flash, session
+import json
+import tempfile
+import traceback # エラー詳細表示用
+from flask import Flask, render_template, request, redirect, url_for, session, flash
 from twikit import Client
-import traceback # ★★★ tracebackモジュールをインポート ★★★
-import json # エラー処理で使う可能性
+# from twikit.errors import TwitterException # twikitのエラーを具体的に補足する場合
 
-# --- Flask アプリケーションの設定 ---
 app = Flask(__name__)
-# ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-# 重要: Flaskのセッション機能には `secret_key` の設定が必須です。
-# これは絶対に秘密にし、ランダムで予測困難な文字列を設定してください。
-# 以下のキーは単なる例です。必ず変更してください！
-# 環境変数 FLASK_SECRET_KEY から読み込むことを強く推奨します。
-# 例: python -c "import os; print(os.urandom(24).hex())" で生成
-app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'CHANGE_THIS_TO_A_VERY_SECURE_RANDOM_KEY')
-# ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'csv_exports')
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+# Flaskのセッション機能を使うにはsecret_keyが必須です。
+# 必ずランダムで安全な文字列に変更してください。
+# Renderの環境変数に設定することを強く推奨します。
+app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'your_very_secret_and_random_key_fallback')
 
-# --- twikit 設定 ---
-SCRAPE_TWEETS_COUNT = 50
-SEARCH_TYPE = 'Latest'
+# --- twikit クライアント初期化 (非同期関数内で使用) ---
+# client = Client('ja') # グローバルには置かず、各関数内で初期化する
 
-# --- twikit 関連の非同期関数 ---
-async def search_and_process_keyword(client, keyword):
-    """【変更なし】指定されたキーワードで検索し、データをリストで返す"""
-    print(f"キーワード '{keyword}' で検索中 (最大{SCRAPE_TWEETS_COUNT}件)...")
-    tweets_data = []
-    try:
-        tweets = await client.search_tweet(
-            keyword, SEARCH_TYPE, count=SCRAPE_TWEETS_COUNT
-        )
-        if tweets:
-            print(f"  {len(tweets)} 件発見。処理中...")
-            for tweet in tweets:
-                user_name, screen_name, tweet_url = "N/A", "N/A", "N/A"
-                if tweet.user:
-                    user_name = tweet.user.name
-                    screen_name = tweet.user.screen_name
-                    tweet_url = f"https://twitter.com/{screen_name}/status/{tweet.id}"
-                tweets_data.append({
-                    'keyword': keyword, 'time': tweet.created_at, 'user_name': user_name,
-                    'screen_name': screen_name, 'text': getattr(tweet, 'text', '').replace('\n', ' '),
-                    'tweet_url': tweet_url, 'tweet_id': tweet.id,
-                })
-        else:
-            print(f"  キーワード '{keyword}' でツイートが見つかりませんでした。")
-    except Exception as e:
-        print(f"!!! キーワード '{keyword}' の検索処理中にエラーが発生: {e}")
-        raise e
-    return tweets_data
-
-# --- Flask ルート定義 ---
-
-@app.before_request
-def check_login_session():
-    """【変更なし】リクエスト毎にセッションをチェック"""
-    if request.endpoint and request.endpoint not in ('login', 'static'):
-        if 'logged_in' not in session or not session['logged_in']:
-            flash('このページにアクセスするにはログインが必要です。', 'info')
-            return redirect(url_for('login'))
+# --- ルート定義 ---
 
 @app.route('/')
 def index():
-    """【変更なし】トップページ (検索フォームページ) を表示"""
-    return render_template('index.html')
+    """ ログイン状態に応じて表示を切り替える """
+    if 'twikit_cookies' in session:
+        # ログイン済みなら検索ページへ
+        return render_template('search.html')
+    else:
+        # 未ログインならログインページへ
+        return render_template('login.html')
 
 @app.route('/login', methods=['GET', 'POST'])
-def login():
-    """【修正】ログインページの表示と認証処理 (エラー詳細ログ出力追加)"""
-    if session.get('logged_in'):
-        return redirect(url_for('index'))
-
+async def login():
+    """ ログイン処理 """
     if request.method == 'POST':
-        auth_info_1 = request.form.get('auth_info_1')
+        username = request.form.get('username')
         password = request.form.get('password')
-        login_error = None
-        login_success = False
+        # email = request.form.get('email') # 必要なら
 
-        if not auth_info_1 or not password:
-            flash('ユーザー情報とパスワードの両方を入力してください。', 'danger')
+        if not username or not password:
+            flash('ユーザー名とパスワードを入力してください。', 'error')
             return render_template('login.html')
+
+        client = Client('ja')
+        cookie_filepath = None # finally で使うため
 
         try:
-            # --- 非同期ログイン検証処理 ---
-            # この async def ブロック内で twikit の login を呼び出します
-            async def run_login_verification(): # 関数名は run_login_check でなくてもOK
-                nonlocal login_success, login_error # 外側の変数を変更
-                client = Client('ja-JP')
-                try:
-                    print(f"ユーザー '{auth_info_1}' のログイン検証試行...")
-                    await client.login(auth_info_1=auth_info_1, password=password)
-                    print("ログイン検証成功。")
-                    login_success = True
-                except Exception as e:
-                    # --- ★★★ エラーログ強化 ここから ★★★ ---
-                    print("-" * 20 + " twikit login エラー詳細 " + "-" * 20)
-                    print(f"!!! twikitログイン検証中にエラーが発生: {type(e).__name__}: {e}")
-                    print("--- Traceback ---")
-                    traceback.print_exc() # 詳しいエラー情報をログに出力
-                    print("--- End Traceback ---")
-                    # --- ★★★ エラーログ強化 ここまで ★★★ ---
-                    login_success = False # エラー発生時は失敗
-                    login_error_detail = str(e).lower()
-                    # (エラーメッセージ判定は前回と同様)
-                    if 'challenge' in login_error_detail or 'verification' in login_error_detail or 'two factor' in login_error_detail:
-                         login_error = f"ログイン検証失敗。2段階認証エラーの可能性。アプリパスワード等を試してください。 詳細: {e}"
-                    elif 'incorrect' in login_error_detail or 'invalid' in login_error_detail:
-                         login_error = f"ログイン検証失敗: ユーザー情報/パスワード間違いの可能性。 詳細: {e}"
-                    else:
-                         login_error = f"ログイン検証中にエラーが発生しました: {e}"
+            print(f"ユーザー '{username}' のログイン試行...")
+            # --- ログイン実行 ---
+            await client.login(
+                auth_info_1=username,
+                password=password
+                # auth_info_2=email, # 必要ならコメント解除
+            )
+            print("ログイン成功。Cookie情報を取得・保存します...")
 
-            # 非同期関数を実行
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(run_login_verification()) # 上で定義した関数を実行
-            loop.close()
-            # --- 非同期ログイン検証処理ここまで ---
+            # --- Cookie情報を一時ファイル経由で取得し、セッションに保存 ---
+            # NamedTemporaryFileで確実に一時ファイルを作成・管理
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json', encoding='utf-8') as tmp_cookie_file:
+                cookie_filepath = tmp_cookie_file.name
+                client.save_cookies(cookie_filepath) # 一時ファイルに保存
+
+            # 一時ファイルから内容を読み込んでセッションに保存
+            with open(cookie_filepath, 'r', encoding='utf-8') as f:
+                cookie_data = json.load(f)
+            session['twikit_cookies'] = cookie_data # 辞書としてセッションに保存
+            print("Cookie情報をセッションに保存しました。")
+
+            flash('ログインに成功しました！', 'success')
+            return redirect(url_for('search_page')) # 検索ページへリダイレクト
 
         except Exception as e:
-            print(f"!!! Flaskログイン検証処理エラー: {e}")
-            traceback.print_exc()
-            login_error = f"ログイン検証処理中に予期せぬエラー: {e}"
-
-        # ログイン結果の処理
-        if login_success:
-            session['logged_in'] = True
-            session['username'] = auth_info_1
-            session['password'] = password
-            flash('ログイン成功！検索ページに移動します。', 'success')
-            return redirect(url_for('index'))
-        else:
-            if login_error:
-                flash(login_error, 'danger')
-            else:
-                flash('ログイン検証に失敗しました。原因不明のエラーです。', 'danger')
+            # twikitのエラーは種類が多いので、一旦まとめて捕捉
+            error_type = type(e).__name__
+            error_message = str(e)
+            print(f"!!! ログイン失敗: {error_type}: {error_message}")
+            traceback.print_exc() # 詳細なトレースバックをログに出力
+            # 特に 'BadRequest: status: 400, message: "Missing data..."' が発生するか確認
+            flash(f'ログインに失敗しました: {error_message}', 'error')
             return render_template('login.html')
 
-    # GETリクエストの場合
+        finally:
+            # 一時ファイルを確実に削除
+            if cookie_filepath and os.path.exists(cookie_filepath):
+                try:
+                    os.remove(cookie_filepath)
+                    print("一時Cookieファイルを削除しました。")
+                except OSError as remove_err:
+                    print(f"!!! 一時Cookieファイルの削除に失敗: {remove_err}")
+
+    # GETリクエストの場合 or ログイン失敗後の再表示
     return render_template('login.html')
 
-@app.route('/search', methods=['POST'])
-def search():
-    """【修正済】キーワードを受け取り、毎回ログインして検索を実行"""
-    if 'logged_in' not in session or not session['logged_in'] or \
-       'username' not in session or 'password' not in session:
-         flash('ログイン情報がありません。再度ログインしてください。', 'danger')
-         session.clear()
-         return redirect(url_for('login'))
+@app.route('/search', methods=['GET', 'POST'])
+async def search_page():
+    """ 検索ページ表示と検索実行 """
+    # --- ログイン状態(セッションのCookie)を確認 ---
+    cookie_data = session.get('twikit_cookies')
+    if not cookie_data:
+        flash('ログインが必要です。', 'warning')
+        return redirect(url_for('login'))
 
-    keywords_input = request.form.get('keywords', '')
-    search_keywords_list = [kw.strip() for kw in keywords_input.split(',') if kw.strip()]
+    client = Client('ja')
+    cookie_filepath = None # finally 用
+    results = []
+    keyword = ""
 
-    if not search_keywords_list:
-        flash('検索キーワードが入力されていません。', 'warning')
-        return render_template('index.html', keywords=keywords_input)
-
-    auth_info_1 = session['username']
-    password = session['password']
-
-    csv_files_info = {}
-    search_error = None
+    # --- Cookieデータをクライアントに設定 ---
     try:
-        # --- 非同期検索処理 (毎回ログインを含む) ---
-        async def run_searches_with_relogin():
-            nonlocal search_error, csv_files_info
-            client = Client('ja-JP')
-            logged_in_this_request = False
-            try:
-                print(f"検索実行のため、ユーザー '{auth_info_1}' で再ログイン試行...")
+        # セッションのCookieデータを一時ファイルに書き出す
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json', encoding='utf-8') as tmp_cookie_file:
+            json.dump(cookie_data, tmp_cookie_file)
+            cookie_filepath = tmp_cookie_file.name
+
+        client.load_cookies(cookie_filepath) # 一時ファイルからCookieを読み込む
+        print("セッションからCookieを読み込み、クライアントに設定しました。")
+
+    except Exception as load_err:
+        print(f"!!! Cookieの読み込み/設定エラー: {load_err}")
+        traceback.print_exc()
+        session.pop('twikit_cookies', None) # エラー時はセッションをクリア
+        flash('セッション情報の読み込みに失敗しました。再ログインしてください。', 'error')
+        return redirect(url_for('login'))
+    finally:
+            # 一時ファイルを確実に削除
+            if cookie_filepath and os.path.exists(cookie_filepath):
                 try:
-                    await client.login(auth_info_1=auth_info_1, password=password)
-                    print("再ログイン成功。検索処理を開始します。")
-                    logged_in_this_request = True
-                except Exception as relogin_e:
-                    print(f"!!! 検索時の再ログインに失敗: {relogin_e}")
-                    # ★ 再ログイン失敗時もトレースバックを表示 ★
-                    print("-" * 20 + " 再ログインエラー詳細 " + "-" * 20)
-                    traceback.print_exc()
-                    print("-" * 20)
-                    search_error = f"検索実行前の再ログインに失敗しました: {relogin_e}"
-                    session.clear() # セッションクリアして次回ログインを促す
-                    raise Exception("再ログイン失敗のため処理中断") from relogin_e
+                    os.remove(cookie_filepath)
+                    print("一時Cookieファイル(読み込み用)を削除しました。")
+                except OSError as remove_err:
+                    print(f"!!! 一時Cookieファイル(読み込み用)の削除に失敗: {remove_err}")
 
-                if logged_in_this_request:
-                    print(f"検索キーワード: {search_keywords_list}")
-                    for keyword in search_keywords_list:
-                        try:
-                            data = await search_and_process_keyword(client, keyword)
-                            if data:
-                                # (CSV保存処理 - 変更なし)
-                                safe_keyword_part = "".join(c if c.isalnum() else "_" for c in keyword)[:50]
-                                filename = f"{safe_keyword_part}.csv"
-                                filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-                                df = pd.DataFrame(data)
-                                columns_order = ['keyword', 'time', 'user_name', 'screen_name', 'text', 'tweet_url', 'tweet_id']
-                                existing_columns = [col for col in columns_order if col in df.columns]
-                                df_reordered = df.reindex(columns=existing_columns + [col for col in df.columns if col not in existing_columns])
-                                df_reordered.to_csv(filepath, index=False, encoding='utf-8-sig')
-                                csv_files_info[keyword] = filename
-                                print(f"  キーワード '{keyword}' の検索結果を {filename} に保存しました。")
-                            else:
-                                print(f"  キーワード '{keyword}' でツイートが見つかりませんでした。")
-                        except Exception as keyword_e:
-                             print(f"!!! キーワード '{keyword}' の処理中にエラーが発生: {keyword_e}")
-                             current_error = f"キーワード '{keyword}': {keyword_e}"
-                             search_error = (search_error + "\n" + current_error) if search_error else current_error
-                             error_str_lower = str(keyword_e).lower()
-                             # 認証関連のエラーならループ中断＆セッションクリア
-                             if "auth_token" in error_str_lower or "bad guest token" in error_str_lower or isinstance(keyword_e, json.JSONDecodeError) or "401" in error_str_lower or "unauthorized" in error_str_lower:
-                                  search_error += " (ログイン認証に失敗した可能性があります)"
-                                  session.clear()
-                                  raise Exception("認証エラーのため全キーワードの処理を中断") from keyword_e
-                        finally:
-                             await asyncio.sleep(3) # 負荷軽減
+    # --- 検索実行 (POSTリクエストの場合) ---
+    if request.method == 'POST':
+        keyword = request.form.get('keyword')
+        if not keyword:
+            flash('検索キーワードを入力してください。', 'warning')
+        else:
+            try:
+                print(f"キーワード '{keyword}' でツイートを検索します...")
+                # product="Latest" で新しい順、"Top"で話題順
+                tweets = await client.search_tweet(query=keyword, product='Latest', count=50) # count は適宜調整
+                print(f"{len(tweets)} 件のツイートが見つかりました。")
 
-            except Exception as e: # 再ログイン失敗 or 検索中の共通エラー
-                print(f"!!! 検索処理中にエラーが発生: {e}")
-                if not search_error:
-                    search_error = f"検索処理中にエラーが発生しました: {e}"
-            finally:
-                pass # client.close()など
+                for tweet in tweets:
+                    results.append({
+                        'id': tweet.id,
+                        'user_name': getattr(tweet.user, 'name', 'N/A'), # ユーザー情報が取得できるか試す
+                        'screen_name': getattr(tweet.user, 'screen_name', 'N/A'),
+                        'created_at': tweet.created_at_datetime.strftime('%Y-%m-%d %H:%M:%S') if tweet.created_at_datetime else 'N/A',
+                        'text': tweet.text,
+                        'url': f"https://twitter.com/{getattr(tweet.user, 'screen_name', 'i')}/status/{tweet.id}" if getattr(tweet.user, 'screen_name', None) else ""
+                        # 他に必要な情報を追加
+                    })
 
-        # 非同期実行
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(run_searches_with_relogin())
-        loop.close()
-        # --- 非同期検索処理ここまで ---
+            except Exception as search_err:
+                # 例: twikit.errors.Forbidden: 403 Forbidden: The request is not allowed -> Cookie切れの可能性
+                error_type = type(search_err).__name__
+                error_message = str(search_err)
+                print(f"!!! 検索エラー: {error_type}: {error_message}")
+                traceback.print_exc()
+                # Cookieが無効になった可能性があればセッションをクリア
+                # (エラーの種類を特定して判定するのが望ましい)
+                session.pop('twikit_cookies', None)
+                flash(f'ツイートの検索中にエラーが発生しました。Cookieが無効になった可能性があります。再ログインしてください。\n({error_message})', 'error')
+                return redirect(url_for('login')) # エラー時はログインページへ
 
-    except Exception as e:
-        print(f"!!! Flask検索ルート処理全体でエラーが発生: {e}")
-        traceback.print_exc()
-        search_error = f"検索処理中に予期せぬエラーが発生しました: {e}"
-
-    # --- 検索結果の表示 ---
-    if search_error:
-        flash(search_error, 'danger')
-        if "再ログイン失敗" in search_error or "ログイン認証に失敗" in search_error:
-             return redirect(url_for('login')) # 再ログインを促す
-    if not csv_files_info and not search_error:
-        flash('指定されたキーワードでツイートが見つかりませんでした。', 'info')
-    elif csv_files_info and not search_error:
-         flash('検索が完了し、以下のCSVファイルが生成されました。', 'success')
-
-    return render_template('index.html', csv_files=csv_files_info, keywords=keywords_input)
-
-
-@app.route('/download/<path:filename>')
-def download_file(filename):
-    """【変更なし】生成されたCSVファイルをダウンロードさせる"""
-    try:
-        safe_dir = os.path.abspath(app.config["UPLOAD_FOLDER"])
-        safe_path = os.path.abspath(os.path.join(safe_dir, filename))
-        if os.path.commonpath((safe_dir, safe_path)) != safe_dir:
-             raise FileNotFoundError("不正なファイル名です。")
-        if not os.path.isfile(safe_path):
-             raise FileNotFoundError(f"ファイル '{filename}' がサーバー上に見つかりません。")
-        return send_from_directory(directory=safe_dir, path=filename, as_attachment=True)
-    except FileNotFoundError as e:
-        print(f"!!! ファイルダウンロードエラー: {e}")
-        flash(str(e), 'danger')
-        return redirect(url_for('index'))
-    except Exception as e:
-        print(f"!!! ファイルダウンロード中に予期せぬエラー: {e}")
-        traceback.print_exc()
-        flash(f"ファイルのダウンロード中にエラーが発生しました: {e}", 'danger')
-        return redirect(url_for('index'))
-
+    # GETリクエストまたは検索実行後
+    return render_template('search.html', keyword=keyword, results=results)
 
 @app.route('/logout')
 def logout():
-    """【変更なし】セッション情報をクリアしてログアウトする"""
-    session.clear() # Flaskセッションの情報をすべて削除
-    flash('ログアウトしました。', 'success')
-    return redirect(url_for('login')) # ログアウト後はログインページへ
+    """ ログアウト処理 (セッションからCookie情報を削除) """
+    session.pop('twikit_cookies', None)
+    flash('ログアウトしました。', 'info')
+    return redirect(url_for('login'))
 
-# --- アプリケーションの実行 ---
+# --- アプリ実行 ---
 if __name__ == '__main__':
-    print("Flask開発サーバーを起動します...")
-    print(f"CSV出力先ディレクトリ: {app.config['UPLOAD_FOLDER']}")
-    # ★★★ 重要 ★★★ Flask secret_key の設定確認
-    if app.secret_key == 'a-very-complex-and-secret-key-please-change' or app.secret_key == 'dev_secret_key_please_change':
-        print("\n" + "="*60)
-        print("警告: Flask の secret_key が安全でない可能性があります！")
-        print("必ず予測困難な秘密のキーに変更してください。")
-        print("例: `python -c 'import os; print(os.urandom(24).hex())'` で生成")
-        print("="*60 + "\n")
-
-    # Flask 開発サーバーを起動
-    # 公開環境では Gunicorn などの WSGI サーバーを使用してください。
-    app.run(debug=True, host='127.0.0.1', port=5000)
+    # Flaskの開発サーバーで実行 (デバッグ用)
+    # RenderではGunicornが使われるため、ここは直接実行されない
+    app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
