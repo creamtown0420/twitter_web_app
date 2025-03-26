@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="ja">
+<head>
+    <meta charset="utf-8">
+    <title>Twitter Keyword Search</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; }
+        .results { margin-top: 20px; border-top: 1px solid #eee; padding-top: 15px; }
+        .error { color: red; }
+        .loading { font-style: italic; }
+        form label { display: block; margin-bottom: 5px;}
+        form input[type="text"] { width: 300px; padding: 5px; margin-bottom: 10px; border: 1px solid #ccc; }
+        form button { padding: 8px 15px; margin-right: 10px; background-color: #28a745; color: white; border: none; border-radius: 4px; cursor: pointer;}
+        form button:hover { background-color: #218838; }
+        .header-area { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; padding-bottom: 10px; border-bottom: 1px solid #eee;}
+        .logout-link a { text-decoration: none; color: #dc3545; padding: 5px 10px; border: 1px solid #dc3545; border-radius: 4px;}
+        .logout-link a:hover { background-color: #dc3545; color: white; }
+        /* Flashメッセージ用スタイル */
+        .alert { padding: 10px; margin-bottom: 15px; border-radius: 4px; }
+        .alert-info { background-color: #d1ecf1; border-color: #bee5eb; color: #0c5460; }
+        .alert-success { background-color: #d4edda; border-color: #c3e6cb; color: #155724; }
+        .alert-warning { background-color: #fff3cd; border-color: #ffeeba; color: #856404; }
+        .alert-danger { background-color: #f8d7da; border-color: #f5c6cb; color: #721c24; }
+        ul { list-style: none; padding-left: 0; }
+        li { margin-bottom: 5px; }
+        li a { text-decoration: none; }
+        li a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="header-area">
+        <h1>Twitter キーワード検索</h1>
+        <div class="logout-link">
+            <a href="{{ url_for('logout') }}">ログアウト</a>
+        </div>
+    </div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}
+          <div class="alert alert-{{ category }}">{{ message }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <form method="post" action="{{ url_for('search') }}">
+        <label for="keywords">検索キーワード (カンマ区切り):</label>
+        <input type="text" id="keywords" name="keywords" value="{{ keywords or '' }}" required>
+        <br>
+        <button type="submit">検索実行</button>
+    </form>
+
+    <div id="loading-indicator" style="display: none;" class="loading">
+        検索中です... しばらくお待ちください。
+    </div>
+
+    {% if error %}
+    <div class="alert alert-danger">エラー: {{ error }}</div>
+    {% endif %}
+
+    {% if csv_files %}
+    <div class="results">
+        <h2>検索結果 (CSVダウンロード)</h2>
+        <ul>
+            {% for keyword, filename in csv_files.items() %}
+            <li>{{ keyword }}: <a href="{{ url_for('download_file', filename=filename) }}">{{ filename }}</a></li>
+            {% endfor %}
+        </ul>
+    </div>
+    {% endif %}
+
+    <script>
+        const form = document.querySelector('form');
+        const loadingIndicator = document.getElementById('loading-indicator');
+        if (form) {
+            form.addEventListener('submit', function() {
+                if (loadingIndicator) {
+                    loadingIndicator.style.display = 'block';
+                }
+            });
+        }
+    </script>
+
+</body>
+</html>
